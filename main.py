@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import telebot
@@ -11,178 +12,257 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
-    raise ValueError("Error: TELEGRAM_BOT_TOKEN এবং GROQ_API_KEY এনভায়রনমেন্ট ভেরিয়েবলে সেট করা নেই!")
+    raise ValueError("Error: TELEGRAM_BOT_TOKEN and GROQ_API_KEY must be set in Environment Variables!")
 
 # ==========================================
-# 2. INITIALIZATION & AUTO MODEL SELECTOR
+# 2. INITIALIZATION & SMART MODEL SELECTOR
 # ==========================================
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 user_memory = {}
-ACTIVE_MODEL = None
+user_mode = {}
+AVAILABLE_MODELS = []
 
-def get_working_model():
-    """Groq API থেকে স্বয়ংক্রিয়ভাবে সচল চ্যাট মডেল খুঁজে বের করার ফাংশন"""
-    global ACTIVE_MODEL
-    if ACTIVE_MODEL:
-        return ACTIVE_MODEL
-    
+def refresh_available_models():
+    """Fetches the live list of working models from your Groq account."""
+    global AVAILABLE_MODELS
     try:
         models = groq_client.models.list()
-        available_ids = [m.id for m in models.data]
-        print("Available Groq Models:", available_ids)
-        
-        # পছন্দের মডেলের তালিকা (যেটি আগে পাওয়া যাবে সেটি সেট হবে)
-        preferred_models = [
-            "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
-            "llama-3.1-8b-instant",
-            "llama3-70b-8192",
-            "llama3-8b-8192",
-            "mixtral-8x7b-32768",
-            "gemma2-9b-it"
+        AVAILABLE_MODELS = [
+            m.id for m in models.data
+            if not any(skip in m.id.lower() for skip in ["whisper", "guard", "tts", "embed", "vision"])
         ]
-        
-        for pref in preferred_models:
-            if pref in available_ids:
-                ACTIVE_MODEL = pref
-                print(f"Selected Preferred Model: {ACTIVE_MODEL}")
-                return ACTIVE_MODEL
-        
-        # ওপরের কোনোটিই না থাকলে অডিও (whisper) বা গার্ড মডেল বাদে যেকোনো সচল চ্যাট মডেল নেবে
-        for m_id in available_ids:
-            if not any(skip in m_id.lower() for skip in ["whisper", "guard", "tts", "embed", "vision"]):
-                ACTIVE_MODEL = m_id
-                print(f"Selected Fallback Model: {ACTIVE_MODEL}")
-                return ACTIVE_MODEL
-                
+        print("Live Groq Models:", AVAILABLE_MODELS)
     except Exception as e:
-        print(f"Error fetching model list: {e}")
-    
-    # ডিফল্ট ফলব্যাক
-    return "llama3-8b-8192"
+        print(f"Error fetching models: {e}")
 
-# শুরুতেই সচল মডেলটি খুঁজে নেওয়া হচ্ছে
-ACTIVE_MODEL = get_working_model()
+refresh_available_models()
+
+def get_best_model(mode="fast"):
+    """Selects the best working model based on user mode (DeepSeek vs Fast Chat)."""
+    if not AVAILABLE_MODELS:
+        refresh_available_models()
+
+    if mode == "deepseek":
+        for m in AVAILABLE_MODELS:
+            if "deepseek" in m.lower() or "qwen" in m.lower():
+                return m
+
+    preferred_fast = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama3-70b-8192",
+        "llama-3.1-8b-instant",
+        "llama3-8b-8192",
+        "gemma2-9b-it",
+        "mixtral-8x7b-32768"
+    ]
+    for pref in preferred_fast:
+        if pref in AVAILABLE_MODELS:
+            return pref
+
+    return AVAILABLE_MODELS[0] if AVAILABLE_MODELS else "llama3-8b-8192"
 
 # ==========================================
-# 3. FUTURE PIPELINE MODULES (পরবর্তী ধাপগুলোর জন্য প্রস্তুত)
+# 3. YOUR CUSTOM SYSTEM PROMPT & MEMORY HELPERS
+# ==========================================
+SYSTEM_PROMPT = """You are a helpful, direct, and fast AI assistant integrated into a Telegram Bot. Your intelligence is powered by the Groq API, and you are running asynchronously on a Render cloud server.
+
+### 1. ENVIRONMENT & CONTEXT
+- PLATFORM: Telegram Messenger. Your responses must be optimized for mobile reading.
+- INFRASTRUCTURE: Hosted on Render web services. Optimize performance for low-latency delivery.
+- CORE ENGINE: Groq API (LLM). You process user messages and return instantaneous, high-quality responses.
+
+### 2. RESPONSE GUIDELINES (TELEGRAM STYLING)
+- INTERACTIVE FORMATTING: Use standard Markdown (**bold**, `inline code`, and ```code blocks```). Always ensure tags are strictly closed to prevent Telegram parsing errors.
+- BREVITY & SCANNABILITY: Keep sentences short and use active voice. Users on Telegram read on mobile screens; avoid long paragraphs. Use functional emojis only as visual bullets or section breaks.
+- DIRECT HIERARCHY: Always put the most critical answer, data point, or response in the very first sentence. Provide background details or context below it.
+- LANGUAGE: Reply in the same language the user writes in (Bengali or English).
+
+### 3. OPERATIONAL BOUNDARIES
+- Maintain strict chat context memory up to the application's configuration limits.
+- Remain polite, engaging, and professional. Match the user's tone while maintaining a peer-like, helpful demeanor."""
+
+def build_safe_messages(chat_id, new_text):
+    """Strictly controls token length so 'Error 400: context_length_exceeded' never happens."""
+    if len(new_text) > 2500:
+        new_text = new_text[:2500] + "\n...[Text trimmed to fit memory limit]"
+
+    if chat_id not in user_memory or not user_memory[chat_id]:
+        user_memory[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    user_memory[chat_id].append({"role": "user", "content": new_text})
+
+    # Keep system prompt + last 4 messages
+    if len(user_memory[chat_id]) > 5:
+        user_memory[chat_id] = [user_memory[chat_id][0]] + user_memory[chat_id][-4:]
+
+    # Cap total memory characters at 5000
+    while len(user_memory[chat_id]) > 2:
+        total_chars = sum(len(m["content"]) for m in user_memory[chat_id])
+        if total_chars > 5000:
+            user_memory[chat_id].pop(1)
+        else:
+            break
+
+    return user_memory[chat_id]
+
+def clean_deepseek_output(text):
+    """Removes <think>...</think> tags from DeepSeek R1 outputs."""
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    return cleaned if cleaned else text
+
+def send_smart_reply(message, text):
+    """Splits long messages into chunks and safely handles Telegram formatting."""
+    max_len = 4000
+    for i in range(0, len(text), max_len):
+        chunk = text[i:i + max_len]
+        try:
+            bot.reply_to(message, chunk, parse_mode="Markdown")
+        except Exception:
+            # Automatic fallback to plain text if unclosed Markdown symbols exist
+            bot.reply_to(message, chunk)
+
+# ==========================================
+# 4. FUTURE PIPELINE MODULES (Phase 2-6 Hooks)
 # ==========================================
 def fetch_news_module(topic):
-    """ধাপ ২: News API দিয়ে খবর খোঁজা"""
     pass
 
 def verify_and_store_sql(news_data):
-    """ধাপ ৩: DeepSeek API দিয়ে ভেরিফাই এবং SQL ডাটাবেসে সেভ করা"""
     pass
 
 def format_with_gemini(verified_data):
-    """ধাপ ৪: Gemini API দিয়ে সুন্দর রিপোর্ট ফরম্যাট তৈরি"""
     pass
 
 def generate_pdf_hf(formatted_text):
-    """ধাপ ৫: Hugging Face API দিয়ে PDF তৈরি"""
     pass
 
 def generate_audio_elevenlabs(summary_text):
-    """ধাপ ৬: ElevenLabs API দিয়ে অডিও ওভারভিউ তৈরি"""
     pass
 
 # ==========================================
-# 4. TELEGRAM BOT HANDLERS
+# 5. TELEGRAM BOT COMMANDS & HANDLERS
 # ==========================================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    model_name = get_working_model()
+    chat_id = message.chat.id
+    mode = user_mode.get(chat_id, "fast")
+    active_model = get_best_model(mode)
+    
     welcome_text = (
-        "হ্যালো! আমি আপনার এআই রিসার্চ ও নিউজ অ্যাসিস্ট্যান্ট।\n\n"
-        f"বর্তমানে আমি **Groq API ({model_name})** এর মাধ্যমে সুপার-ফাস্ট চ্যাটবট হিসেবে কাজ করছি।\n"
-        "যেকোনো প্রশ্ন করুন, আমি সাথে সাথে উত্তর দেবো!\n\n"
-        "*(মেমোরি রিসেট করতে /clear এবং সচল মডেল দেখতে /model লিখুন)*"
+        "⚡ **Groq AI Assistant is Online!**\n\n"
+        f"🧠 **Active Engine:** `{active_model}`\n\n"
+        "📌 **Quick Commands:**\n"
+        "• `/fast` - Instant replies (Llama 3)\n"
+        "• `/deepseek` - Deep reasoning mode (DeepSeek)\n"
+        "• `/clear` - Reset conversation memory\n"
+        "• `/model` - Check active model\n\n"
+        "Send any text question in **Bengali** or **English** to begin!"
     )
-    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+    send_smart_reply(message, welcome_text)
+
+@bot.message_handler(commands=['deepseek'])
+def set_deepseek_mode(message):
+    chat_id = message.chat.id
+    user_mode[chat_id] = "deepseek"
+    model = get_best_model("deepseek")
+    bot.reply_to(message, f"🧠 **DeepSeek Reasoning Mode Activated!**\nActive Model: `{model}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=['fast'])
+def set_fast_mode(message):
+    chat_id = message.chat.id
+    user_mode[chat_id] = "fast"
+    model = get_best_model("fast")
+    bot.reply_to(message, f"⚡ **Fast Mode Activated!**\nActive Model: `{model}`", parse_mode="Markdown")
 
 @bot.message_handler(commands=['model'])
-def show_model(message):
-    model_name = get_working_model()
-    bot.reply_to(message, f"বর্তমানে সচল থাকা এআই মডেল: `{model_name}`", parse_mode="Markdown")
+def show_current_model(message):
+    chat_id = message.chat.id
+    mode = user_mode.get(chat_id, "fast")
+    model = get_best_model(mode)
+    bot.reply_to(message, f"📌 **Current Mode:** `{mode.upper()}`\n🧠 **Active Model:** `{model}`", parse_mode="Markdown")
 
 @bot.message_handler(commands=['clear'])
-def clear_memory(message):
+def clear_chat_memory(message):
     chat_id = message.chat.id
-    user_memory[chat_id] = []
-    bot.reply_to(message, "মেমোরি ক্লিয়ার করা হয়েছে! নতুন করে কথা শুরু করতে পারেন।")
+    user_memory[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    bot.reply_to(message, "🧹 **Memory cleared!** Send a new message to start fresh.", parse_mode="Markdown")
 
-@bot.message_handler(func=lambda message: True)
-def handle_chat(message):
-    global ACTIVE_MODEL
+# Operational Boundary: Handle unsupported media types (voice, photos, documents, etc.)
+@bot.message_handler(content_types=['audio', 'photo', 'voice', 'video', 'document', 'sticker', 'location', 'contact'])
+def handle_unsupported_media(message):
+    reply = (
+        "⚠️ **Text Messages Only**\n"
+        "I currently process text input only. Please type your question or paste your text directly! "
+        "*(টেলিগ্রামে অনুগ্রহ করে টেক্সট মেসেজ পাঠান)*"
+    )
+    bot.reply_to(message, reply, parse_mode="Markdown")
+
+@bot.message_handler(content_types=['text'])
+def handle_all_messages(message):
     chat_id = message.chat.id
     user_text = message.text
 
     if not user_text:
         return
 
-    # চ্যাট হিস্ট্রি সেটআপ
-    if chat_id not in user_memory or not user_memory[chat_id]:
-        user_memory[chat_id] = [
-            {
-                "role": "system",
-                "content": "You are a helpful, smart, and fast AI assistant. You reply clearly in Bengali or English depending on the user's language."
-            }
-        ]
-
-    # ইউজারের মেসেজ মেমোরিতে যোগ করা
-    user_memory[chat_id].append({"role": "user", "content": user_text})
-
-    # মেমোরি যাতে অতিরিক্ত বড় না হয় (শেষ ১০টি মেসেজ রাখা হবে)
-    if len(user_memory[chat_id]) > 11:
-        user_memory[chat_id] = [user_memory[chat_id][0]] + user_memory[chat_id][-10:]
+    bot.send_chat_action(chat_id, 'typing')
+    
+    mode = user_mode.get(chat_id, "fast")
+    current_model = get_best_model(mode)
+    safe_messages = build_safe_messages(chat_id, user_text)
 
     try:
-        bot.send_chat_action(chat_id, 'typing')
-        current_model = get_working_model()
-
-        # Groq API কল
         completion = groq_client.chat.completions.create(
             model=current_model,
-            messages=user_memory[chat_id],
-            temperature=0.7,
+            messages=safe_messages,
+            temperature=0.6,
             max_tokens=1024,
         )
-
         ai_reply = completion.choices[0].message.content
+        ai_reply = clean_deepseek_output(ai_reply)
 
-        # AI-এর উত্তর মেমোরিতে সেভ করা এবং টেলিগ্রামে পাঠানো
-        user_memory[chat_id].append({"role": "assistant", "content": ai_reply})
-        bot.reply_to(message, ai_reply)
+        user_memory[chat_id].append({"role": "assistant", "content": ai_reply[:1200]})
+        send_smart_reply(message, ai_reply)
 
     except Exception as e:
-        # যদি কোনো কারণে মডেল পরিবর্তন হয়, তবে রিসেট করে নতুন সচল মডেল দিয়ে আবার চেষ্টা করবে
-        ACTIVE_MODEL = None
-        fallback_model = get_working_model()
+        print(f"First attempt error ({current_model}): {e}")
         try:
+            refresh_available_models()
+            fallback_model = get_best_model("fast")
+            
+            emergency_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text[:1000]}
+            ]
+            user_memory[chat_id] = emergency_messages
+
             completion = groq_client.chat.completions.create(
                 model=fallback_model,
-                messages=user_memory[chat_id],
-                temperature=0.7,
-                max_tokens=1024,
+                messages=emergency_messages,
+                temperature=0.6,
+                max_tokens=800,
             )
             ai_reply = completion.choices[0].message.content
-            user_memory[chat_id].append({"role": "assistant", "content": ai_reply})
-            bot.reply_to(message, ai_reply)
-        except Exception as retry_error:
-            bot.reply_to(message, f"একটি টেকনিক্যাল সমস্যা হয়েছে: {str(retry_error)}")
+            ai_reply = clean_deepseek_output(ai_reply)
+
+            user_memory[chat_id].append({"role": "assistant", "content": ai_reply[:1000]})
+            send_smart_reply(message, ai_reply)
+
+        except Exception as final_error:
+            bot.reply_to(message, f"⚠️ Server busy. Please type `/clear` and try again.\nDetails: {str(final_error)[:150]}")
 
 # ==========================================
-# 5. RENDER HEALTH CHECK SERVER (Port Binding)
+# 6. RENDER HEALTH CHECK SERVER (24/7 Keep-Alive)
 # ==========================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write("Bot is running smoothly on Render!".encode("utf-8"))
+        self.wfile.write("AI Bot is running 24/7 on Render!".encode("utf-8"))
 
     def log_message(self, format, *args):
         return
@@ -194,14 +274,13 @@ def run_dummy_server():
     server.serve_forever()
 
 # ==========================================
-# 6. MAIN EXECUTION
+# 7. MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    # ব্যাকগ্রাউন্ডে ডামি ওয়েব সার্ভার চালু করা
     server_thread = threading.Thread(target=run_dummy_server)
     server_thread.daemon = True
     server_thread.start()
 
-    print(f"Telegram Bot is polling using model: {ACTIVE_MODEL}...")
+    print("Telegram AI Bot is polling...")
     bot.infinity_polling(timeout=20, long_polling_timeout=10)
     
