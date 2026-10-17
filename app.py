@@ -646,14 +646,16 @@ def telegram_api(method, *, data=None, files=None, timeout=25):
     response = http.post(url, data=data, files=files, timeout=timeout) if files else http.post(
         url, json=data, timeout=timeout
     )
-    if response.status_code != 200:
-    logger.warning(
-        "Telegram getUpdates HTTP %s: %s",
-        response.status_code,
-        response.text[:300]
-    )
-    time.sleep(5)
-    continue
+    
+            if response.status_code != 200:
+                logger.warning(
+                    "Telegram getUpdates HTTP %s: %s",
+                    response.status_code,
+                    response.text[:300]
+                )
+                time.sleep(5)
+                continue
+
 
 def send_message(chat_id, text):
     try:
