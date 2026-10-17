@@ -392,4 +392,30 @@ if __name__ == "__main__":
         print(f"Webhook warning: {e}")
 
     bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
+
+# ==========================================
+# 8. MAIN EXECUTION
+# ==========================================
+if __name__ == "__main__":
+    server_thread = threading.Thread(target=run_dummy_server)
+    server_thread.daemon = True
+    server_thread.start()
+
+    print("Starting Telegram AI Bot safely...")
+    
+    # পুরনো সব কানেকশন ও ওয়েব হুক পরিষ্কার করা
+    try:
+        bot.remove_webhook()
+        time.sleep(3)
+    except Exception as e:
+        print(f"Webhook reset notice: {e}")
+
+    # বটের স্টেবল পোলিং লুপ
+    while True:
+        try:
+            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception as e:
+            print(f"Polling connection reset due to: {e}")
+            time.sleep(5)
+            
     
