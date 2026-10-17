@@ -1,4 +1,3 @@
-
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -20,7 +19,7 @@ if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ইউজারদের কথোপকথন মনে রাখার জন্য মেমোরি (পরবর্তীতে এটি SQL-এ যাবে)
+# ইউজারদের চ্যাট হিস্ট্রি বা মেমোরি
 user_memory = {}
 
 # ==========================================
@@ -39,7 +38,7 @@ def format_with_gemini(verified_data):
     pass
 
 def generate_pdf_hf(formatted_text):
-    """ধাপ ৫: Hugging Face API/Library দিয়ে PDF তৈরি"""
+    """ধাপ ৫: Hugging Face API দিয়ে PDF তৈরি"""
     pass
 
 def generate_audio_elevenlabs(summary_text):
@@ -47,15 +46,15 @@ def generate_audio_elevenlabs(summary_text):
     pass
 
 # ==========================================
-# 4. TELEGRAM BOT HANDLERS (ধাপ ১: Groq Fast Chatbot)
+# 4. TELEGRAM BOT HANDLERS (Groq Fast Chatbot)
 # ==========================================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
         "হ্যালো! আমি আপনার এআই রিসার্চ ও নিউজ অ্যাসিস্ট্যান্ট।\n\n"
-        "বর্তমানে আমি **Groq API**-এর মাধ্যমে সুপার-ফাস্ট চ্যাটবট হিসেবে কাজ করছি।\n"
+        "বর্তমানে আমি **Groq API (Llama 3.1)** এর মাধ্যমে সুপার-ফাস্ট চ্যাটবট হিসেবে কাজ করছি। "
         "যেকোনো প্রশ্ন করুন, আমি সাথে সাথে উত্তর দেবো!\n\n"
-        "*(রিসেট করতে /clear লিখুন)*"
+        "*(মেমোরি রিসেট করতে /clear লিখুন)*"
     )
     bot.reply_to(message, welcome_text, parse_mode="Markdown")
 
@@ -82,7 +81,7 @@ def handle_chat(message):
     # ইউজারের মেসেজ মেমোরিতে যোগ করা
     user_memory[chat_id].append({"role": "user", "content": user_text})
 
-    # মেমোরি যাতে অতিরিক্ত বড় না হয়, তাই শেষ ১০টি মেসেজ রাখা হচ্ছে
+    # মেমোরি যাতে অতিরিক্ত বড় না হয় (শেষ ১০টি মেসেজ রাখা হবে)
     if len(user_memory[chat_id]) > 11:
         user_memory[chat_id] = [user_memory[chat_id][0]] + user_memory[chat_id][-10:]
 
@@ -90,9 +89,9 @@ def handle_chat(message):
         # টেলিগ্রামে 'Typing...' স্ট্যাটাস দেখানো
         bot.send_chat_action(chat_id, 'typing')
 
-        # Groq API কল (Llama 3.3 70B মডেল ব্যবহার করা হয়েছে দ্রুত ও নিখুঁত উত্তরের জন্য)
+        # Groq API কল (সঠিক এবং আপডেট করা মডেল)
         completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=user_memory[chat_id],
             temperature=0.7,
             max_tokens=1024,
@@ -117,7 +116,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write("Bot is running smoothly on Render!".encode("utf-8"))
 
-    # অপ্রয়োজনীয় লগ বন্ধ রাখার জন্য
     def log_message(self, format, *args):
         return
 
@@ -131,12 +129,10 @@ def run_Dummy_server():
 # 6. MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    # ব্যাকগ্রাউন্ডে ডামি ওয়েব সার্ভার চালু করা (Render-এর জন্য আবশ্যিক)
+    # ব্যাকগ্রাউন্ডে ডামি ওয়েব সার্ভার চালু করা
     server_thread = threading.Thread(target=run_Dummy_server)
     server_thread.daemon = True
     server_thread.start()
 
     print("Telegram Bot is polling...")
-    # টেলিগ্রাম বট চালু করা
     bot.infinity_polling(timeout=20, long_polling_timeout=10)
-    
