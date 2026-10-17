@@ -647,12 +647,13 @@ def telegram_api(method, *, data=None, files=None, timeout=25):
         url, json=data, timeout=timeout
     )
     if response.status_code != 200:
-        raise RuntimeError(f"Telegram {method} failed (HTTP {response.status_code}).")
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"Telegram {method} returned ok=false.")
-    return payload.get("result")
-
+    logger.warning(
+        "Telegram getUpdates HTTP %s: %s",
+        response.status_code,
+        response.text[:300]
+    )
+    time.sleep(5)
+    continue
 
 def send_message(chat_id, text):
     try:
