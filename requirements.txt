@@ -1,4 +1,2 @@
 pyTelegramBotAPI==4.22.1
 groq>=0.13.0
-requests>=2.31.0
-gTTS>=2.5.1
