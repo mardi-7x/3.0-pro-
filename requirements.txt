@@ -1,0 +1,7 @@
+# Production dependencies for Groq Telegram AI Chatbot
+pyTelegramBotAPI>=4.26.0
+groq>=0.18.0
+Flask>=3.1.0
+python-dotenv>=1.0.1
+gunicorn>=23.0.0
+requests>=2.32.0
