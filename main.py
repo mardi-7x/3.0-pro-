@@ -1,21 +1,17 @@
-import os, re, time, sqlite3, tempfile, threading, logging
+import os, re, time, sqlite3, tempfile, threading, logging, wave
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 import telebot
 from groq import Groq
 
 # Required: TELEGRAM_BOT_TOKEN, GROQ_API_KEY
-# Optional: NEWS_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID,
-# ELEVENLABS_MODEL_ID, GROQ_MODEL, VOICE_REPLY_MODE, PORT
+# Optional: NEWS_API_KEY, GROQ_MODEL, PORT
+# Audio overview uses Groq English TTS; no ElevenLabs account is needed.
 logging.basicConfig(level=os.getenv('LOG_LEVEL','INFO'), format='%(asctime)s %(levelname)s: %(message)s')
 log = logging.getLogger('morning-intelligence')
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN','').strip()
 GROQ_KEY = os.getenv('GROQ_API_KEY','').strip()
 NEWS_KEY = os.getenv('NEWS_API_KEY','').strip()
-EL_KEY = os.getenv('ELEVENLABS_API_KEY','').strip()
-EL_VOICE = os.getenv('ELEVENLABS_VOICE_ID','').strip()
-EL_MODEL = os.getenv('ELEVENLABS_MODEL_ID','eleven_multilingual_v2')
-VOICE_MODE = os.getenv('VOICE_REPLY_MODE','always').lower()  # always | voice_only | off
 MODEL_OVERRIDE = os.getenv('GROQ_MODEL','').strip()
 DB_PATH = os.getenv('DATABASE_PATH','ai_research.db')
 if not BOT_TOKEN or not GROQ_KEY:
@@ -114,35 +110,10 @@ def generate_reply(chat_id, text):
             except Exception: log.exception('Fallback model failed')
         return f'⚠️ AI service is temporarily unavailable ({type(exc).__name__}). Please try again.'
 
-def make_tts(text):
-    if not EL_KEY or not EL_VOICE: return None
-    text = (text or '').strip()
-    if not text: return None
-    if len(text) > 2500: text = text[:2400].rsplit(' ',1)[0] + '. The full answer is in the text message.'
-    try:
-        r = requests.post(f'https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}',
-            headers={'xi-api-key':EL_KEY,'Content-Type':'application/json','Accept':'audio/mpeg'},
-            json={'text':text,'model_id':EL_MODEL}, timeout=90)
-        if r.status_code >= 400:
-            log.error('ElevenLabs HTTP %s: %s', r.status_code, r.text[:300]); return None
-        f = tempfile.NamedTemporaryFile(prefix='mi_tts_', suffix='.mp3', delete=False)
-        f.write(r.content); f.close(); return f.name
-    except Exception: log.exception('TTS failed'); return None
-
 def send_answer(message, answer, was_voice=False):
-    send_text(message, answer)  # Text reply is always sent.
-    if VOICE_MODE == 'off' or (VOICE_MODE == 'voice_only' and not was_voice): return
-    path = make_tts(answer)
-    if not path: return
-    try:
-        with open(path,'rb') as audio_file:
-            # MP3 is sent as an audio attachment. A Telegram round voice-note bubble
-            # needs OGG/Opus conversion; this version does not require ffmpeg on Render.
-            bot.send_audio(message.chat.id, audio_file, title='Morning Intelligence AI Reply', caption='🔊 AI voice reply')
-    except Exception: log.exception('Audio send failed')
-    finally:
-        try: os.remove(path)
-        except OSError: pass
+    # Ordinary chat replies are text-only. Audio is generated only by /audiooverview.
+    send_text(message, answer)
+
 
 def process_text(message, text, was_voice=False):
     bot.send_chat_action(message.chat.id,'typing')
@@ -198,7 +169,7 @@ def saved_news():
 
 @bot.message_handler(commands=['start','help'])
 def start(message):
-    send_text(message,f'🤖 Morning Intelligence is online!\nModel: {choose_model(user_modes.get(message.chat.id,"fast"))}\n\nSend text or a Telegram voice message.\n\n/news <topic> — recent news\n/saved — saved news\n/fast — fast mode\n/deep — alternate model mode\n/model — current model\n/clear — clear temporary memory\n/feedback <note> — save feedback')
+    send_text(message,f'🤖 Morning Intelligence is online!\nModel: {choose_model(user_modes.get(message.chat.id,"fast"))}\n\nSend text or a Telegram voice message.\n\n/news <topic> — recent news\n/saved — saved news\n/fast — fast mode\n/deep — alternate model mode\n/model — current model\n/clear — clear temporary memory\n/feedback <note> — save feedback\n/audiooverview — create an English audio overview from saved news')
 
 @bot.message_handler(commands=['news'])
 def news_cmd(message):
@@ -227,6 +198,137 @@ def feedback_cmd(message):
     if not note: send_text(message,'Usage: /feedback answer was helpful, but needs more sources'); return
     with db() as c: c.execute('INSERT INTO feedback(chat_id,note) VALUES(?,?)',(message.chat.id,note[:2000]))
     send_text(message,'Thanks! Feedback saved for review; it does not automatically retrain the model.')
+
+def get_recent_news_for_overview(limit=5):
+    with db() as c:
+        rows = c.execute(
+            "SELECT title, description, source, published_at, url "
+            "FROM news_store ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return rows
+
+
+def split_for_groq_tts(text, limit=180):
+    """Split English narration into chunks below Groq Orpheus's 200-character limit."""
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if not text:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks, current = [], ""
+    for sentence in sentences:
+        while len(sentence) > limit:
+            cut = sentence.rfind(" ", 0, limit + 1)
+            if cut < 1:
+                cut = limit
+            piece, sentence = sentence[:cut].strip(), sentence[cut:].strip()
+            if current:
+                chunks.append(current)
+                current = ""
+            if piece:
+                chunks.append(piece)
+        if not sentence:
+            continue
+        candidate = (current + " " + sentence).strip()
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def create_groq_audio_overview(script):
+    """Create a WAV overview using Groq TTS, without ElevenLabs."""
+    chunks = split_for_groq_tts(script)
+    if not chunks:
+        raise ValueError("The audio overview script is empty.")
+
+    with tempfile.TemporaryDirectory(prefix="mi_audio_overview_") as folder:
+        wav_paths = []
+        for index, chunk in enumerate(chunks, 1):
+            response = ai.audio.speech.create(
+                model="canopylabs/orpheus-v1-english",
+                voice="troy",
+                input=chunk,
+                response_format="wav",
+            )
+            chunk_path = os.path.join(folder, f"chunk_{index}.wav")
+            response.write_to_file(chunk_path)
+            wav_paths.append(chunk_path)
+
+        output_path = os.path.join(folder, "audio_overview.wav")
+        with wave.open(wav_paths[0], "rb") as first:
+            params = first.getparams()
+            with wave.open(output_path, "wb") as output:
+                output.setparams(params)
+                for path in wav_paths:
+                    with wave.open(path, "rb") as chunk_file:
+                        if chunk_file.getparams()[:4] != params[:4]:
+                            raise ValueError("TTS audio chunks have incompatible WAV formats.")
+                        output.writeframes(chunk_file.readframes(chunk_file.getnframes()))
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
+@bot.message_handler(commands=["audiooverview"])
+def audio_overview_cmd(message):
+    rows = get_recent_news_for_overview(limit=5)
+    if not rows:
+        send_text(message, "No saved news yet. First run /news Artificial Intelligence, then /audiooverview.")
+        return
+
+    source_text = "\n".join(
+        f"Headline: {title}. Summary: {description or 'No summary provided'}. "
+        f"Source: {source or 'Unknown'}. Published: {published or 'Unknown'}."
+        for title, description, source, published, url in rows
+    )
+    bot.send_chat_action(message.chat.id, "typing")
+    try:
+        result = ai.chat.completions.create(
+            model=choose_model("fast"),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Write a concise, natural English audio news overview from only the "
+                        "provided saved-news records. Say it summarizes saved articles and is "
+                        "not a guarantee of all current headlines. Do not invent facts. "
+                        "Aim for 3-5 short sentences and keep the script under 900 characters."
+                    ),
+                },
+                {"role": "user", "content": source_text[:10000]},
+            ],
+            temperature=0.3,
+            max_completion_tokens=500,
+        )
+        script = (result.choices[0].message.content or "").strip()
+        if not script:
+            send_text(message, "Could not create the audio overview script. Please try again.")
+            return
+
+        send_text(message, "📰 Audio overview script\n\n" + script)
+        audio_bytes = create_groq_audio_overview(script)
+        import io
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = "morning_intelligence_audio_overview.wav"
+        bot.send_audio(
+            message.chat.id,
+            audio_file,
+            title="Morning Intelligence Audio Overview",
+            caption="🎧 Audio overview (English)",
+        )
+    except Exception as exc:
+        log.exception("Audio overview generation failed")
+        send_text(
+            message,
+            "⚠️ I couldn't generate the audio overview. Check the Render logs and confirm "
+            "that your Groq account/API key can access the Groq TTS model. "
+            f"Error: {type(exc).__name__}."
+        )
+
 
 @bot.message_handler(content_types=['voice'])
 def voice_handler(message):
@@ -261,4 +363,3 @@ if __name__=='__main__':
         try: bot.infinity_polling(timeout=20,long_polling_timeout=15,skip_pending=True,allowed_updates=['message'])
         except KeyboardInterrupt: break
         except Exception: log.exception('Polling failed; retrying in 5 seconds'); time.sleep(5)
-        
